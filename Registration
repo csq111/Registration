@@ -1,0 +1,505 @@
+import os.path
+import time
+import numpy as np
+from dipy.io.image import load_nifti_data
+from dipy.viz import regtools
+from dipy.align.imaffine import (transform_centers_of_mass,
+                                 AffineMap,
+                                 MutualInformationMetric,
+                                 AffineRegistration)
+from dipy.align.transforms import (TranslationTransform3D,
+                                   RigidTransform3D,
+                                   AffineTransform3D)
+import nibabel as nib
+from dipy.align.metrics import CCMetric
+from dipy.align.imwarp import SymmetricDiffeomorphicRegistration
+from dipy.segment.mask import median_otsu
+import matplotlib.pyplot as plt
+from dipy.workflows.align import ApplyTransformFlow
+from pkg_resources import normalize_path
+from scipy.ndimage import affine_transform
+import os
+from scipy.ndimage import zoom
+
+
+#from withmask import fa_data
+
+
+#from nipype.interfaces.spm import Coregister
+
+
+class Registration():
+    def __init__(self):
+        pass
+    def resampled_mask(self,mask_img,target_shape):
+        mask_data = np.asanyarray(mask_img)
+        zoom_factors = (
+            target_shape[0] / mask_data.shape[0],
+            target_shape[1] / mask_data.shape[1],
+            target_shape[2] / mask_data.shape[2]
+        )
+        resampled_mask_data = zoom(mask_data, zoom_factors,order=0)
+        return resampled_mask_data
+
+    # def DWI_mask2DTI_mask(q_spaceimg_path,mdimg_path):
+    #     q_spaceimg = nib.load(q_spaceimg_path)
+    #     mdimg = nib.load(mdimg_path)
+    #
+    #     b0_data = np.asanyarray(q_spaceimg.dataobj)
+    #
+    #     if len(b0_data.shape) >= 4:
+    #         b0_data = b0_data[:,:,:,0]
+    #     b0_img = nib.Nifti1Image(b0_data,q_spaceimg.affine)
+    #     static_data = np.asanyarray(mdimg.dataobj)
+    #     moving_data = np.asanyarray(b0_img.dataobj)
+    #     initial_affine = np.eye(4)
+    #     reg = Registration()
+    #     rigid_matrix = reg.Rigid()
+    #     warped_mask_data = rigid_matrix.transform(b0_data)
+    #     DTI_maskimg = nib.Nifti1Image(warped_mask_data,b0_img.affine)
+    #     os.chdir(base_path)
+    #     os.makedirs(DTI_maskimg, exist_ok=True)
+    #     save_path_index8 = os.path.join(base_path, 'DTI mask', 'DTI Mask.nii')
+    #     nib.save(new_brain_maskimg, save_path_index8)
+    #     return DTI_maskimg
+
+
+    def Common(self, staticimg, movingimg, static_maskimg,moving_maskimg,showResult=True):
+        static = np.asanyarray(staticimg.dataobj)
+        if len(static.shape) >= 4:
+            static = static[:, :, :, 0]
+        moving = np.asanyarray(movingimg.dataobj)
+        if len(moving.shape) >= 4:
+            moving = moving[:, :, :, 0]
+
+
+        if static_maskimg is not None:
+            static_mask = np.asanyarray(static_maskimg.dataobj)
+            if static_mask.shape != static.shape:
+                static_mask = self.resampled_mask(static_mask,static.shape)
+        else:
+            static_mask = np.ones(static.shape)
+        if moving_maskimg is not None:
+            moving_mask = np.asanyarray(moving_maskimg.dataobj)
+            if moving_mask.shape != moving.shape:
+                moving_mask = self.resampled_mask(moving_mask,moving.shape)
+        else:
+            moving_mask = np.ones(moving.shape)
+
+        identity = np.eye(4)
+        affine_map = AffineMap(identity,
+                               static.shape, staticimg.affine,
+                               moving.shape, movingimg.affine,
+                               static_mask.shape, static_maskimg.affine,
+                               moving_mask.shape, moving_maskimg.affine)
+        if showResult:
+            self.ShowResultImg(static, moving, affine_map, 'common')
+
+        resampled = affine_map.transform(moving)
+
+        return affine_map, resampled
+
+    def ShowResultImg(self, static, moving, transmap, fname):
+        resampled = transmap.transform(moving)
+        fig3 = regtools.overlay_slices(static, resampled, None, 2,
+                                       "Static", "Moving", fname + "_transformed_2.png")
+        fig3.show()
+
+
+
+    def CreateAffineRegObj(self,static,moving,static_mask,moving_mask):
+        # Specify parameters for the affine registration
+        nbins = 32
+        sampling_prop = None  # full sampling
+        metric = MutualInformationMetric(nbins, sampling_prop)
+
+
+
+
+
+
+        level_iters = [1000, 100, 10]
+        sigmas = [3.0, 1.0, 0.0]
+        factors = [4, 2, 1]
+
+        affreg = AffineRegistration(metric=metric,
+                                    level_iters=level_iters,
+                                    sigmas=sigmas,
+                                    factors=factors)
+        return affreg
+
+    def Affine(self, staticimg, movingimg, static_maskimg,moving_maskimg,showResult=True):
+        static = np.asanyarray(staticimg.dataobj)
+        moving = np.asanyarray(movingimg.dataobj)
+        if static_maskimg is not None:
+            static_mask = np.asanyarray(static_maskimg.dataobj)
+            if static_mask.shape != static.shape:
+                static_mask = self.resampled_mask(static_mask,static.shape)
+        else:
+            static_mask = np.ones(static.shape)
+        if moving_maskimg is not None:
+            moving_mask = np.asanyarray(moving_maskimg.dataobj)
+            if moving_mask.shape != moving.shape:
+                moving_mask = self.resampled_mask(moving_mask,moving.shape)
+        else:
+            moving_mask = np.ones(moving.shape)
+
+        c_of_mass = transform_centers_of_mass(static, staticimg.affine,
+                                              moving, movingimg.affine)
+
+        affreg = self.CreateAffineRegObj(static,moving,static_mask,moving_mask)
+        params0 = None
+
+        start = time.perf_counter()
+        # step: affine based on center-of-mass transform
+        print("Do affine transform")
+        transform = AffineTransform3D()
+        starting_affine = c_of_mass.affine
+        affine_map = affreg.optimize(static, moving, transform, params0,
+                                     staticimg.affine, movingimg.affine,
+                                     static_mask = static_mask,
+                                     moving_mask = moving_mask,
+                                     starting_affine=starting_affine)
+        stop = time.perf_counter()
+        print("Affine transform time: ", stop - start)
+        start = stop
+
+        if showResult:
+            self.ShowResultImg(static, moving, affine_map, 'affine')
+
+        return affine_map
+
+    def Rigid(self, staticimg, movingimg,static_maskimg,moving_maskimg, showResult=True):
+        """
+        新增方法：刚性配准（只包含旋转和平移）
+        """
+        static = np.asanyarray(staticimg.dataobj)
+        moving = np.asanyarray(movingimg.dataobj)
+        if static_maskimg is not None:
+            static_mask = np.asanyarray(static_maskimg.dataobj)
+            if static_mask.shape != static.shape:
+                static_mask = self.resampled_mask(static_mask,static.shape)
+        else:
+            static_mask = np.ones(static.shape)
+        if moving_maskimg is not None:
+            moving_mask = np.asanyarray(moving_maskimg.dataobj)
+            if moving_mask.shape != moving.shape:
+                moving_mask = self.resampled_mask(moving_mask,moving.shape)
+        else:
+            moving_mask = np.ones(moving.shape)
+        c_of_mass = transform_centers_of_mass(static, staticimg.affine,
+                                              moving, movingimg.affine)
+        affreg = self.CreateAffineRegObj(static,moving,static_mask,moving_mask)
+        params0 = None
+        print("Do rigid transform")
+        transform = RigidTransform3D()
+        starting_affine = c_of_mass.affine
+        rigid_map = affreg.optimize(static, moving, transform, params0,
+                                    staticimg.affine, movingimg.affine,
+                                    static_mask=static_mask,
+                                    moving_mask=moving_mask,
+                                    starting_affine=starting_affine)
+        if showResult:
+            self.ShowResultImg(static, moving, rigid_map, 'rigid')
+        return rigid_map
+
+    def Nonlinear(self, staticimg, movingimg,static_maskimg,moving_maskimg, prealign=None, showResult=True):
+        static = np.asanyarray(staticimg.dataobj)
+        moving = np.asanyarray(movingimg.dataobj)
+        if static_maskimg is not None:
+            static_mask = np.asanyarray(static_maskimg.dataobj)
+            if static_mask.shape != static.shape:
+                static_mask = self.resampled_mask(static_mask,static.shape)
+        else:
+            pass
+        if moving_maskimg is not None:
+            moving_mask = np.asanyarray(moving_maskimg.dataobj)
+            if moving_mask.shape != moving.shape:
+                moving_mask = self.resampled_mask(moving_mask,moving.shape)
+        else:
+            pass
+
+        if prealign is None:
+            affine_map = self.Affine(staticimg, movingimg,static_maskimg,moving_maskimg)
+            prealign = affine_map.affine
+        metric = CCMetric(3)
+        level_iters = [20, 10, 5]
+        sdr = SymmetricDiffeomorphicRegistration(metric, level_iters)
+        # 注意：根据 DIPY 版本不同，此处参数名称可能不同，若报错请调整为 init_transform 或去除该参数
+        nonlinear_map = sdr.optimize(static, moving, staticimg.affine, movingimg.affine,
+                                     prealign=prealign)
+
+        if showResult:
+            self.ShowResultImg(static, moving, nonlinear_map, 'nonlinear')
+
+        return nonlinear_map
+
+
+    def ApplyTransform(self, img,translation_matrix):
+        data = img.get_fdata()
+        affine = img.affine
+        transformed_data = affine_transform(data,np.linalg.inv(translation_matrix))
+        new_img = nib.Nifti1Image(transformed_data,affine)
+        return new_img
+
+def get_image_center(img):
+    shape = img.shape
+    center = [dim_size/2 for dim_size in shape[:3]]
+    return center
+def translation_matrix(center_from,center_to):
+    translation = np.array(center_to) - np.array(center_from)
+    matrix = np.array([
+        [1,0,0,translation[0]],
+        [0,1,0,translation[1]],
+        [0,0,1,translation[2]],
+        [0,0,0,1]
+    ])
+    return matrix
+
+def crerate_dti_mask(dwi_maskimg,para_FA_img,para_MD_img,base_path):
+    dwi_mask_data = np.asanyarray(dwi_maskimg.dataobj)
+    fa_data = np.asanyarray(para_FA_img.dataobj)
+    fa_data_binary = np.where(fa_data>0,1,0)
+    md_data = np.asanyarray(para_MD_img.dataobj)
+    #print(fa_data.min(),fa_data.max())
+    threshold = 1e-10
+    md_data_binary = np.where(md_data-1e-10>0,1,0)
+    #print(md_data_binary.min(), md_data_binary.max())
+    reg = Registration()
+    rigid_map = reg.Rigid(staticimg=para_MD_img,movingimg=dwi_maskimg,static_maskimg=None,moving_maskimg=None,showResult=True)
+    mask = rigid_map.transform(dwi_mask_data)
+    dti_mask_fa = nib.Nifti1Image(mask,para_FA_img.affine,para_FA_img.header)
+    dti_mask_md = nib.Nifti1Image(mask,para_MD_img.affine,para_MD_img.header)
+    dti_mask_data_fa = np.asanyarray(dti_mask_fa)
+    dti_mask_data_md = np.asanyarray(dti_mask_md)
+    mask_binary = np.where(mask>0,1,0)
+    final_mask_data_fa = fa_data_binary * (1 - mask)
+    final_mask_data_md = md_data_binary * (1 - mask)
+
+    final_dti_mask_fa = nib.Nifti1Image(final_mask_data_fa,para_FA_img.affine,para_FA_img.header)
+    final_dti_mask_md = nib.Nifti1Image(final_mask_data_fa,para_MD_img.affine,para_MD_img.header)
+    return final_dti_mask_fa,final_dti_mask_md
+
+def create_brain_mask(brain_mask,t1_mask):
+    brain_maskimg = nib.load(brain_mask)
+    brain_mask_data = np.asanyarray(brain_maskimg.dataobj)
+    t1_maskimg = nib.load(t1_mask)
+    t1_maskimg_data = np.asanyarray(t1_maskimg.dataobj)
+    brain_mask_without_lesion_data = np.where(t1_maskimg_data>0,0,brain_mask_data)
+    new_brain_maskimg = nib.Nifti1Image(brain_mask_without_lesion_data,brain_maskimg.affine,brain_maskimg.header)
+    return new_brain_maskimg
+
+def process_subject(subject_dir):
+    try:
+        # 确保所有路径均基于 original_path
+        t1_path = os.path.join(original_path, subject_dir, 't1_mprage_sag_1mm_iso_brain.nii')
+        para_FA_path = os.path.join(original_path, subject_dir, 'DTI_standard/standard_fa.nii')
+        para_MD_path = os.path.join(original_path, subject_dir, 'DTI_standard/standard_md.nii')
+        brain_mask = os.path.join(original_path, subject_dir, 't1_mprage_sag_1mm_iso_brain_mask.nii.gz')
+        t1_mask = os.path.join(original_path,subject_dir, 't1_mprage_sag_1mm_iso_mask.nii.gz')
+        dwi_mask = os.path.join(original_path,subject_dir,'q-space_2mm_PA_mask.nii.gz')
+
+
+
+
+        # 检查文件是否存在
+        if not all([os.path.exists(t1_path), os.path.exists(para_FA_path)]):
+            print(f"Missing files for {subject_dir}, skipping.")
+            return
+
+        # 加载图像create_brain_mask(brain_mask,t1_maskimg)
+        t1img = nib.load(t1_path)
+        template_img = nib.load('/nvme-data/Stem_Cell_Results/MRI_MQ/map_noddi_dti_part1/spm12_T1/ch2bet.nii')
+        aal = nib.load('/nvme-data/Stem_Cell_Results/MRI_MQ/map_noddi_dti_part1/Original_AAL3/AAL3.nii')
+        t1_maskimg = nib.load(t1_mask)
+        para_FA_img = nib.load(para_FA_path)
+        para_MD_img = nib.load(para_MD_path)
+        dwi_maskimg = nib.load(dwi_mask)
+        #create brain mask
+        inverse_brain_mask = create_brain_mask(brain_mask,t1_mask)
+        output_dir = os.path.join(original_path, subject_dir, "Inverse_Brain_Mask")
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'Inverse_Brain_Mask.nii')
+        nib.save(inverse_brain_mask, save_path)
+
+        #create dti mask
+        final_dti_mask_fa,final_dti_mask_md = crerate_dti_mask(dwi_maskimg=dwi_maskimg,para_FA_img=para_FA_img,para_MD_img=para_MD_img,base_path=original_path)
+        output_dir = os.path.join(original_path, subject_dir, "Inverse_DTI_Mask")
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_fa = os.path.join(output_dir, 'Inverse_DTI_Mask_fa.nii')
+        save_path_md = os.path.join(output_dir, 'Inverse_DTI_Mask_md.nii')
+        nib.save(final_dti_mask_fa, save_path_fa)
+        nib.save(final_dti_mask_md, save_path_md)
+        # 配准流程
+        reg = Registration()
+        affine_map = reg.Affine(staticimg=t1img, movingimg=template_img, static_maskimg=inverse_brain_mask,moving_maskimg=None,showResult=True)
+        nonlinear_map = reg.Nonlinear(staticimg=t1img, movingimg=template_img, static_maskimg=inverse_brain_mask,moving_maskimg=None,prealign=affine_map.affine,
+                                      showResult=True)
+
+        # 配准 AAL 到 T1 空间
+        aal_data = np.asanyarray(aal.dataobj)
+        aal_registered_data = nonlinear_map.transform(aal_data)
+        aal_registered_img = nib.Nifti1Image(aal_registered_data, t1img.affine)
+
+
+        output_dir = os.path.join(original_path, subject_dir, "Registration_Template_Index")
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'aal_nonlinear.nii')
+        nib.save(aal_registered_img, save_path)
+
+        # 对 FA 进行刚性配准
+        rigid_paraT1_map = reg.Rigid(staticimg=t1img, movingimg=para_FA_img,static_maskimg=inverse_brain_mask,moving_maskimg=final_dti_mask_fa,showResult=True)
+        para_FA_img_data = np.asanyarray(para_FA_img.dataobj)
+        fa_rigid_2_T1wi = rigid_paraT1_map.transform(para_FA_img_data)
+        final_fa_img = nib.Nifti1Image(fa_rigid_2_T1wi, t1img.affine)
+        output_dir = os.path.join(original_path, subject_dir, "DTI_FA_Rigid2_T1WI")
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'fa_rigid_2_t1wi.nii')
+        nib.save(final_fa_img, save_path)
+        # rigid reg for MD
+        rigid_paraT1_map_MD = reg.Rigid(staticimg=t1img, movingimg=para_MD_img, static_maskimg=inverse_brain_mask,
+                                     moving_maskimg=final_dti_mask_md, showResult=True)
+        para_MD_img_data = np.asanyarray(para_MD_img.dataobj)
+        md_rigid_2_T1wi = rigid_paraT1_map_MD.transform(para_MD_img_data)
+        final_md_img = nib.Nifti1Image(md_rigid_2_T1wi, t1img.affine)
+
+        output_dir = os.path.join(original_path, subject_dir, "DTI_MD_Rigid2_T1WI")
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'md_rigid_2_t1wi.nii')
+        nib.save(final_md_img, save_path)
+
+        print(f'Success: {subject_dir}')
+    except Exception as error:
+        print(f'Error in {subject_dir}: {str(error)}')
+
+
+if __name__ == '__main__':
+    original_path = r'/nvme-data/Stem_Cell_Results/MRI_MQ/adjust data part2/'
+    for subject_folder in os.listdir(original_path):
+        process_subject(subject_folder)
+    print('All done.')
+
+
+
+
+
+# if __name__ == '__main__':
+#     # 文件路径设置
+#     base_path = r'/nvme-data/Stem_Cell_Results/MRI_MQ/map_noddi_dti_part1/FU_YI_DONG_Y23082800010/'
+#     t1 = base_path + 't1_mprage_sag_1mm_iso_brain.nii'  # 静态图像：经过BET处理的T1图像
+#     template = base_path + 'ch2bet.nii'  # 移动图像：SPM处理后的T1图像
+#     aal = base_path + 'AAL3.nii'  # 待配准的aal图像
+#     para_FA = base_path + '/DTI_standard/standard_fa.nii'
+#     t1_mask = base_path + '/t1_mprage_sag_1mm_iso_mask.nii.gz'
+#     brain_mask = base_path + '/t1_mprage_sag_1mm_iso_brain_mask.nii.gz'
+#     dwi_mask = base_path + '/q-space_2mm_PA_mask.nii.gz'
+#     para_MD = base_path + '/DTI_standard/standard_md.nii'
+#     #DTI_mask = Registration.DWI_mask2DTI_mask(q_spaceimg_path=dwi_mask,mdimg_path=para_MD)
+#
+#
+#
+#     # 加载图像
+#     t1img = nib.load(t1)
+#     templateimg = nib.load(template)
+#     para_FA_img = nib.load(para_FA)
+#     para_MD_img = nib.load(para_MD)
+#     aal_img = nib.load(aal)
+#     reg = Registration()
+#     #t1mask
+#     t1_maskimg = nib.load(t1_mask)
+#     t1img_data = np.asanyarray(t1img.dataobj)
+#     t1_maskimg_data = np.asanyarray(t1_maskimg.dataobj)
+#     #brain_mask
+#     brain_maskimg = nib.load(brain_mask)
+#     brain_mask_data = np.asanyarray(brain_maskimg.dataobj)
+#     t1_maskimg = nib.load(t1_mask)
+#     t1_maskimg_data = np.asanyarray(t1_maskimg.dataobj)
+#     brain_mask_without_lesion_data = np.where(t1_maskimg_data>0,0,brain_mask_data)
+#     new_brain_maskimg = nib.Nifti1Image(brain_mask_without_lesion_data,brain_maskimg.affine,brain_maskimg.header)
+#     os.chdir(base_path)
+#     Inverse_Brain_Mask = "Inverse_Brain_Mask"
+#     os.makedirs(Inverse_Brain_Mask, exist_ok=True)
+#     save_path_index8 = os.path.join( base_path,'Inverse_Brain_Mask', 'Inverse_Brain_Mask.nii')
+#     nib.save(new_brain_maskimg, save_path_index8)
+#     # # #dtimask
+#     dti_maskimg = nib.load(dwi_mask)
+#     dti_maskimg_data = np.asanyarray(dti_maskimg.dataobj)
+#     fa_data = np.asanyarray(para_FA_img.dataobj)
+#     fa_data_binary = np.where(fa_data>0,1,0)
+#     rigid_map = reg.Rigid(staticimg=para_FA_img,movingimg=dti_maskimg,static_maskimg=None,moving_maskimg=None,showResult=True)
+#     fa_mask = rigid_map.transform(dti_maskimg_data)
+#     DTI_maskimg = nib.Nifti1Image(fa_mask,para_FA_img.affine)
+#     DTI_maskimg_data = np.asanyarray(DTI_maskimg.dataobj)
+#
+#     fa_mask_binary = np.where(fa_mask>0,1,0)
+#
+#     final_mask_data =  fa_data_binary * (1 - fa_mask_binary)
+#     #final_dtimaskimg = nib.Nifti1Image(final_mask_data,para_FA_img.affine,para_FA_img.header)
+#     # final_dtimaskimg_data = np.asanyarray(final_dtimaskimg.dataobj)
+#     # final_mask_binary = np.where(final_dtimaskimg_data>0,1,0)
+#     final_dti_mask = nib.Nifti1Image(final_mask_data,para_FA_img.affine,para_FA_img.header)
+#     os.chdir(base_path)
+#     DTI_mask = "DTI_MASK"
+#     os.makedirs(DTI_mask, exist_ok=True)
+#     save_path_index4 = os.path.join( base_path,'DTI_MASK', 'DTI_Mask.nii')
+#     nib.save(final_dti_mask, save_path_index4)
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#     # 先对 t1 与 template 做配准，获得变换参数
+#     #inverse_brain_maskimg = create_brain_mask(brain_mask,t1_maskimg)
+#     #final_dti_mask = crerate_dti_mask(dwi_mask,para_FA_img,para_MD_img,base_path)
+#     affine_map = reg.Affine(staticimg=t1img, movingimg=templateimg, showResult=True,static_maskimg=Inverse_Brain_Mask,moving_maskimg=final_dti_mask)
+#     nonlinear_map = reg.Nonlinear(staticimg=t1img, movingimg=templateimg,
+#                                   prealign=affine_map.affine, showResult=True,static_maskimg=Inverse_Brain_Mask,moving_maskimg=final_dti_mask)
+#
+#
+#
+#     # （可根据需要保存或记录该变换，此处仅展示）
+#
+#     # 利用上述非线性配准参数，将 aal 图像配准到 t1 空间
+#
+#     aal_data = np.asanyarray(aal_img.dataobj)
+#     aal_registered_data = nonlinear_map.transform(aal_data)
+#     aal_registered_img = nib.Nifti1Image(aal_registered_data, t1img.affine)
+#     os.chdir(base_path)
+#     Registration_Template_Index_1 = "Registration_Template_Index_2"
+#     os.makedirs(Registration_Template_Index_1, exist_ok=True)
+#     save_path_index4 = os.path.join( base_path,'Registration_Template_Index_2', 'aal_nonlinear_2_T1WI.nii')
+#     nib.save(aal_registered_img, save_path_index4)
+#
+#
+#     # 对参数图 para_FA 与 t1 进行刚性配准
+#     rigid_paraT1_map = reg.Rigid(staticimg=t1img, movingimg=para_FA_img, showResult=True,static_maskimg=Inverse_Brain_Mask,moving_maskimg=final_dti_mask)
+#     para_FA_img_data = np.asanyarray(para_FA_img.dataobj)
+#     fa_rigid_2_T1wi = rigid_paraT1_map.transform(para_FA_img_data)
+#     final_fa_img = nib.Nifti1Image(fa_rigid_2_T1wi, t1img.affine)
+#     os.chdir(base_path)
+#     DTI_Rigid2_T1WI_affine = "DTI_Rigid2_T1WI_2"
+#     os.makedirs(DTI_Rigid2_T1WI_affine, exist_ok=True)
+#     save_path_index5 = os.path.join( base_path,'DTI_Rigid2_T1WI_2', 'fa_rigid_2_t1wi.nii')
+#     nib.save(final_fa_img, save_path_index5)
+#
+#     # AAL2FA_map_affine = reg.Nonlinear(staticimg=final_fa_img, movingimg=aal_registered_img, showResult=True,static_maskimg=None,moving_maskimg=None)
+#     # AAL2FA_img_data_affine = np.asanyarray(aal_registered_img.dataobj)
+#     # AAL2FA_affine = AAL2FA_map_affine.transform(AAL2FA_img_data_affine)
+#     # AAL2FA_img_affine = nib.Nifti1Image(AAL2FA_affine, final_fa_img.affine)
+#     # os.chdir(base_path)
+#     # AAL_RIG_FA_affine = "AAL2FA_affine"
+#     # os.makedirs(AAL_RIG_FA_affine, exist_ok=True)
+#     # save_path_index6 = os.path.join( base_path,'AAL2FA_affine', 'AAL2FA_affine.nii')
+#     # nib.save(AAL2FA_img_affine, save_path_index6)
+
+
+
+
