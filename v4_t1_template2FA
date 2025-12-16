@@ -1,0 +1,247 @@
+import time
+import numpy as np
+from dipy.viz import regtools
+from dipy.align.imaffine import (transform_centers_of_mass,
+                                 AffineMap,
+                                 MutualInformationMetric,
+                                 AffineRegistration)
+from dipy.align.transforms import (TranslationTransform3D,
+                                   RigidTransform3D,
+                                   AffineTransform3D)
+import nibabel as nib
+from dipy.align.metrics import CCMetric
+from dipy.align.imwarp import SymmetricDiffeomorphicRegistration
+from dipy.segment.mask import median_otsu
+from scipy.ndimage import zoom
+
+class Registration():
+    def __init__(self):
+        pass
+
+    def resample_mask(self, mask_img, target_shape):
+        """
+        将Mask重采样到目标形状
+        :param mask_img: nibabel 的 Mask 图像对象
+        :param target_shape: 目标形状 (z, y, x)
+        :return: 重采样后的 Mask 数据
+        """
+        mask_data = np.asanyarray(mask_img)
+        zoom_factors = (
+            target_shape[0] / mask_data.shape[0],
+            target_shape[1] / mask_data.shape[1],
+            target_shape[2] / mask_data.shape[2]
+        )
+        resampled_mask_data = zoom(mask_data, zoom_factors, order=0)  # order=0 表示最近邻插值
+        return resampled_mask_data
+
+    def Common(self, staticimg, movingimg, static_mask=None, moving_mask=None, showResult=True):
+        static = staticimg.get_fdata()
+        if len(static.shape) >= 4:
+            static = static[:, :, :, 0]
+        moving = movingimg.get_fdata()
+        if len(moving.shape) >= 4:
+            moving = moving[:, :, :, 0]
+
+        # 应用固定图像Mask
+        if static_mask is not None:
+            static_mask_data = static_mask.get_fdata()
+            if static_mask_data.shape != static.shape:
+                print("Resampling static mask to match static image shape...")
+                static_mask_data = self.resample_mask(static_mask, static.shape)
+            static[static_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        # 应用移动图像Mask
+        if moving_mask is not None:
+            moving_mask_data = moving_mask.get_fdata()
+            if moving_mask_data.shape != moving.shape:
+                print("Resampling moving mask to match moving image shape...")
+                moving_mask_data = self.resample_mask(moving_mask, moving.shape)
+            moving[moving_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        identity = np.eye(4)
+        affine_map = AffineMap(identity,
+                               static.shape, staticimg.affine,
+                               moving.shape, movingimg.affine)
+        if showResult:
+            self.ShowResultImg(static, moving, affine_map, 'common')
+
+        resampled = affine_map.transform(moving)
+        return affine_map, resampled
+
+    def ShowResultImg(self, static, moving, transmap, fname):
+        resampled = transmap.transform(moving)
+        fig3 = regtools.overlay_slices(static, resampled, None, 2,
+                                       "Static", "Moving", fname + "_transformed_2.png")
+        fig3.show()
+
+    def CreateAffineRegObj(self):
+        # Specify parameters for the affine registration
+        nbins = 32
+        sampling_prop = None  # full sampling
+        metric = MutualInformationMetric(nbins, sampling_prop)
+        level_iters = [300, 10, 1]
+        sigmas = [3.0, 1.0, 0.0]
+        factors = [4, 2, 1]
+
+        affreg = AffineRegistration(metric=metric,
+                                    level_iters=level_iters,
+                                    sigmas=sigmas,
+                                    factors=factors)
+        return affreg
+
+    def Affine(self, staticimg, movingimg, static_mask=None, moving_mask=None, showResult=True):
+        static = staticimg.get_fdata()
+        moving = movingimg.get_fdata()
+
+        # 应用固定图像Mask
+        if static_mask is not None:
+            static_mask_data = np.asanyarray(static_mask)
+            if static_mask_data.shape != static.shape:
+                print("Resampling static mask to match static image shape...")
+                static_mask_data = self.resample_mask(static_mask, static.shape)
+            static[static_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        # 应用移动图像Mask
+        if moving_mask is not None:
+            moving_mask_data = moving_mask.get_fdata()
+            if moving_mask_data.shape != moving.shape:
+                print("Resampling moving mask to match moving image shape...")
+                moving_mask_data = self.resample_mask(moving_mask, moving.shape)
+            moving[moving_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        c_of_mass = transform_centers_of_mass(static, staticimg.affine,
+                                              moving, movingimg.affine)
+
+        affreg = self.CreateAffineRegObj()
+        params0 = None
+
+        start = time.perf_counter()
+        # step: affine based on center-of-mass transform
+        print("Do affine transform")
+        transform = AffineTransform3D()
+        starting_affine = c_of_mass.affine
+        affine_map = affreg.optimize(static, moving, transform, params0,
+                                     staticimg.affine, movingimg.affine,
+                                     starting_affine=starting_affine)
+        stop = time.perf_counter()
+        print("Affine transform time: ", stop - start)
+        start = stop
+
+        if showResult:
+            self.ShowResultImg(static, moving, affine_map, 'affine')
+
+        return affine_map
+
+    def Rigid(self, staticimg, movingimg, static_mask=None, moving_mask=None, showResult=True):
+        """
+        新增方法：刚性配准（只包含旋转和平移）
+        """
+        static = staticimg.get_fdata()
+        moving = movingimg.get_fdata()
+
+        # 应用固定图像Mask
+        if static_mask is not None:
+            static_mask_data = static_mask.get_fdata()
+            if static_mask_data.shape != static.shape:
+                print("Resampling static mask to match static image shape...")
+                static_mask_data = self.resample_mask(static_mask, static.shape)
+            static[static_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        # 应用移动图像Mask
+        if moving_mask is not None:
+            moving_mask_data = moving_mask.get_fdata()
+            if moving_mask_data.shape != moving.shape:
+                print("Resampling moving mask to match moving image shape...")
+                moving_mask_data = self.resample_mask(moving_mask, moving.shape)
+            moving[moving_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        c_of_mass = transform_centers_of_mass(static, staticimg.affine,
+                                              moving, movingimg.affine)
+        affreg = self.CreateAffineRegObj()
+        params0 = None
+        print("Do rigid transform")
+        transform = RigidTransform3D()
+        starting_affine = c_of_mass.affine
+        rigid_map = affreg.optimize(static, moving, transform, params0,
+                                    staticimg.affine, movingimg.affine,
+                                    starting_affine=starting_affine)
+        if showResult:
+            self.ShowResultImg(static, moving, rigid_map, 'rigid')
+        return rigid_map
+
+    def Nonlinear(self, staticimg, movingimg, static_mask=None, moving_mask=None, prealign=None, showResult=True):
+        static = staticimg.get_fdata()
+        moving = movingimg.get_fdata()
+
+        # 应用固定图像Mask
+        if static_mask is not None:
+            static_mask_data = static_mask.get_fdata()
+            if static_mask_data.shape != static.shape:
+                print("Resampling static mask to match static image shape...")
+                static_mask_data = self.resample_mask(static_mask, static.shape)
+            static[static_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        # 应用移动图像Mask
+        if moving_mask is not None:
+            moving_mask_data = moving_mask.get_fdata()
+            if moving_mask_data.shape != moving.shape:
+                print("Resampling moving mask to match moving image shape...")
+                moving_mask_data = self.resample_mask(moving_mask, moving.shape)
+            moving[moving_mask_data == 0] = 0  # 将病灶区域设为背景值
+
+        if prealign is None:
+            affine_map = self.Affine(staticimg, movingimg, static_mask, moving_mask)
+            prealign = affine_map.affine
+        metric = CCMetric(3)
+        level_iters = [10, 10, 5]
+        sdr = SymmetricDiffeomorphicRegistration(metric, level_iters)
+        # 注意：根据 DIPY 版本不同，此处参数名称可能不同，若报错请调整为 init_transform 或去除该参数
+        nonlinear_map = sdr.optimize(static, moving, staticimg.affine, movingimg.affine,
+                                     prealign=prealign)
+
+        if showResult:
+            self.ShowResultImg(static, moving, nonlinear_map, 'nonlinear')
+
+        return nonlinear_map
+
+
+if __name__ == '__main__':
+    # 文件路径设置
+    basepath = r'/nvme-data/Stem_Cell_Results/MRI_MQ/Demo_2/test3withmask/FANG_JIN_MING_Y23101000020/'
+    t1 = basepath + 't1_mprage_sag_1mm_iso_brain.nii'  # 静态图像：经过BET处理的T1图像
+    template = basepath + 'ch2bet.nii'  # 移动图像：SPM处理后的T1图像
+    aal = basepath + 'AAL3.nii'  # 待配准的aal图像
+    para_FA = basepath + '/DTI_standard/standard_fa.nii'
+    t1_mask = basepath + '/t1_mprage_sag_1mm_iso_5_mask.nii.gz'
+    dwi_mask = basepath + '/q-space_2mm_PA_9_mask.nii.gz'
+
+    # 加载图像
+    t1img = nib.load(t1)
+    templateimg = nib.load(template)
+    para_FA_img = nib.load(para_FA)
+
+    # 加载Mask（仅加载固定图像的Mask）
+    t1_mask = nib.load(t1_mask)  # 固定图像的Mask
+    aal_mask = None  # 移动图像的Mask设置为None
+
+    reg = Registration()
+
+    # 先对 t1 与 template 做配准，获得变换参数
+    affine_map = reg.Affine(staticimg=t1img, movingimg=templateimg, static_mask=t1_mask, moving_mask=aal_mask, showResult=True)
+    nonlinear_map = reg.Nonlinear(staticimg=t1img, movingimg=templateimg, static_mask=t1_mask, moving_mask=aal_mask,
+                                  prealign=affine_map.affine, showResult=True)
+
+    # 利用上述非线性配准参数，将 aal 图像配准到 t1 空间
+    aal_img = nib.load(aal)
+    aal_data = aal_img.get_fdata()
+    aal_registered_data = nonlinear_map.transform(aal_data)
+
+    aal_registered_img = nib.Nifti1Image(aal_registered_data, t1img.affine)
+    nib.save(aal_registered_img, basepath + 'aal_registered_to_betT1wi.nii')
+
+    # 对参数图 para_FA 与 t1 进行刚性配准
+    rigid_FA2T1 = reg.Rigid(staticimg=t1img, movingimg=para_FA_img, static_mask=t1_mask, moving_mask=None, showResult=True)
+    rigid_FA2T1_data = rigid_FA2T1.transform(para_FA_img.get_fdata())
+
+    final_FA_img = nib.Nifti1Image(rigid_FA2T1_data, t1img.affine)
+    nib.save(final_FA_img, basepath + 'registered_FA2T1wi.nii')
